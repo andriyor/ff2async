@@ -1,0 +1,19 @@
+{
+  "name": "ff-async",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "astray": "^1.1.1",
+    "escodegen": "^2.0.0",
+    "ff": "^0.2.2",
+    "klona": "^2.0.5",
+    "meriyah": "^4.2.0"
+  }
+}
