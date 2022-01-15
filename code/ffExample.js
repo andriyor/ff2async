@@ -14,7 +14,7 @@ function sortFileContents(fileA, fileB, cb) {
   );
 }
 
-ff(
+const f = ff(
   function () {
     fs.readFile(path.join(__dirname, "mock/1.txt"), "utf8", f.slot());
     fs.readFile(path.join(__dirname, "mock/2.txt"), "utf8", f.slot());

@@ -19,66 +19,57 @@ const expressionStatementsWithSlot: {
 }[] = [];
 let argsToVar: string[] = [];
 const expressionsToPromisify: Record<string, AST.Expression> = {};
-let ffExpressionStatement;
 
 astray.walk(codeAST, {
-  ExpressionStatement(callExpression) {
-    // find top level ff
-    if (callExpression.expression?.callee?.object?.callee?.object?.callee?.name === "ff") {
-      ffExpressionStatement = callExpression;
+  CallExpression(callExpression) {
+    if (callExpression.callee.name === "ff") {
       astray.walk(callExpression, {
-        CallExpression(callExpression) {
-          if (callExpression.callee.name === "ff") {
-            astray.walk(callExpression, {
-              FunctionExpression(functionExpression) {
-                argsToVar = [...argsToVar, ...functionExpression.params.map((identifier) => identifier.name)];
-              },
-              ExpressionStatement(expressionStatement) {
-                let withSlot = false;
-                astray.walk(expressionStatement, {
-                  CallExpression(callExpression, state) {
-                    if (callExpression.callee.property && callExpression.callee.property.name === "slot") {
-                      withSlot = true;
-                      // remove last f.slot() argument
-                      expressionStatement.expression.arguments.pop();
-                      // promisify callback functions
-                      if (expressionStatement.expression.callee.name) {
-                        const promisedName = `promised${expressionStatement.expression.callee.name}`;
-                        expressionsToPromisify[promisedName] = { ...expressionStatement.expression.callee };
-                        expressionStatement.expression.callee.name = promisedName;
-                      }
-
-                      if (expressionStatement.expression.callee.object && expressionStatement.expression.callee.property) {
-                        const promisedName = `promised${
-                          expressionStatement.expression.callee.object.name + expressionStatement.expression.callee.property.name
-                        }`;
-                        expressionsToPromisify[promisedName] = { ...expressionStatement.expression.callee };
-
-                        expressionStatement.expression.callee.name = promisedName;
-                        expressionStatement.expression.callee.type = "Identifier";
-                        delete expressionStatement.expression.callee.object;
-                        delete expressionStatement.expression.callee.property;
-                      }
-                      expressionStatementsWithSlot.push({
-                        fromSlot: true,
-                        statement: expressionStatement,
-                      });
-                    }
-                  },
-                });
-                if (!withSlot) {
-                  if (
-                    expressionStatement.expression.callee.object.name === "f" &&
-                    expressionStatement.expression.callee.property.name === "pass"
-                  ) {
-                    expressionStatementsWithSlot.push({
-                      fromSlot: false,
-                      statement: expressionStatement.expression.arguments[0],
-                    });
-                  }
+        FunctionExpression(functionExpression) {
+          argsToVar = [...argsToVar, ...functionExpression.params.map((identifier) => identifier.name)];
+        },
+        ExpressionStatement(expressionStatement) {
+          let withSlot = false;
+          astray.walk(expressionStatement, {
+            CallExpression(callExpression, state) {
+              if (callExpression.callee.property && callExpression.callee.property.name === "slot") {
+                withSlot = true;
+                // remove last f.slot() argument
+                expressionStatement.expression.arguments.pop();
+                // promisify callback functions
+                if (expressionStatement.expression.callee.name) {
+                  const promisedName = `promised${expressionStatement.expression.callee.name}`;
+                  expressionsToPromisify[promisedName] = { ...expressionStatement.expression.callee };
+                  expressionStatement.expression.callee.name = promisedName;
                 }
-              },
-            });
+
+                if (expressionStatement.expression.callee.object && expressionStatement.expression.callee.property) {
+                  const promisedName = `promised${
+                    expressionStatement.expression.callee.object.name + expressionStatement.expression.callee.property.name
+                  }`;
+                  expressionsToPromisify[promisedName] = { ...expressionStatement.expression.callee };
+
+                  expressionStatement.expression.callee.name = promisedName;
+                  expressionStatement.expression.callee.type = "Identifier";
+                  delete expressionStatement.expression.callee.object;
+                  delete expressionStatement.expression.callee.property;
+                }
+                expressionStatementsWithSlot.push({
+                  fromSlot: true,
+                  statement: expressionStatement,
+                });
+              }
+            },
+          });
+          if (!withSlot) {
+            if (
+              expressionStatement.expression.callee.object.name === "f" &&
+              expressionStatement.expression.callee.property.name === "pass"
+            ) {
+              expressionStatementsWithSlot.push({
+                fromSlot: false,
+                statement: expressionStatement.expression.arguments[0],
+              });
+            }
           }
         },
       });
