@@ -67,3 +67,27 @@ A nested chain converts first; the chain around it converts on a later pass, whe
 - `callbackify` turns a falsy rejection into an `Error` with `.reason`.
 - A step's error goes to the handler as before. A throw inside a handler is now an unhandled rejection under `.then()`, not an uncaught exception; both crash Node by default.
 - In TypeScript, `promisify` infers types from the callee, which ff ignored. A cast like `as (..., next: () => void) => void` now gives `Promise<void>`, and tsc reports it. Fix it by hand.
+
+## Codemod or migrate-ff skill
+
+Use both. The codemod does the mechanical bulk; the [`migrate-ff` skill](../ff-behavior/skills/migrate-ff/SKILL.md) does the rest.
+
+The codemod is better at:
+
+- **Same input, same output.** Every chain it converts follows one mapping, so a reviewer learns the output shape once and skims. A rewrite by hand or by the skill can drift per file, e.g. a parallel call quietly made sequential.
+- **Refusing unsafe cases.** It skips any chain whose conversion could change behaviour and says why, instead of relying on someone to remember every gotcha in every file.
+- **Reruns.** Free to run again after a rebase, or on another repo.
+
+The skill is better at:
+
+- **The skipped chains.** They need judgement: code after a slot, whether errors ff dropped should stay dropped, `f` inside a nested callback.
+- **Idiomatic output.** The codemod is faithful but mechanical (`promisify(x.bind(x))`, `pending` arrays, `callbackify` wrappers). The skill can write a plain async function and export it.
+- **Tests.** The skill writes a test against the ff code before converting it. The codemod doesn't, and a project's own tests may barely touch its ff chains: run `node --check` and the type-checker on the result, not just the tests.
+
+Suggested flow:
+
+1. Run the codemod on a branch. Review the diff, fix what tsc reports, and ship it as its own PR; a mechanical diff is easy to review.
+2. Migrate the skipped chains one at a time with the skill, writing a test first for each.
+3. Later, turn `callbackify` wrappers into async exports once their callers are async.
+
+For a handful of chains in a single repo, the skill alone is cheaper.
