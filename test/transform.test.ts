@@ -216,6 +216,137 @@ describe("converts", () => {
   );
 });
 
+describe("converts slots in if/else", () => {
+  check(
+    "optional slot, value is undefined when skipped",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          if (id) api.get(id, f.slot());
+        },
+        (v) => f.pass(v === undefined ? "none" : v)
+      ).onComplete(next);
+    };`,
+    [[1], [0]]
+  );
+
+  check(
+    "slot in both branches, fail in a third",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          if (id === 1) {
+            api.get(id, f.slot());
+          } else if (id === 2) {
+            api.slow(id, f.slot());
+          } else {
+            return f.fail(new Error("bad id"));
+          }
+        },
+        (v) => {
+          if (!v) return f.fail(new Error("empty"));
+          f.pass(v + "!");
+        }
+      ).onComplete(next);
+    };`,
+    [[1], [2], [3]]
+  );
+
+  check(
+    "unconditional slot then optional one; parallel, args in order",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          api.slow(id, f.slot());
+          if (id > 1) {
+            api.get(id, f.slot());
+          }
+        },
+        (a, b) => f.pass([a, b])
+      ).onComplete(next);
+    };`,
+    [[1], [2]]
+  );
+
+  check(
+    "slot in one branch, pass in the other",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          if (id) {
+            api.get(id, f.slot());
+          } else {
+            f.pass(null);
+          }
+          if (id !== 2) {
+            api.slow(id, f.slot());
+          } else {
+            f.pass("two");
+          }
+        },
+        (a, b) => f.pass([a, b])
+      ).onComplete(next);
+    };`,
+    [[1], [0], [2]]
+  );
+
+  check(
+    "early succeed before a branch, slot error in a branch",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          if (id === 0) {
+            return f.succeed("zero");
+          }
+          if (id === 1) {
+            api.bad(id, f.slot());
+          } else {
+            api.get(id, f.slot());
+          }
+        },
+        (v) => f.pass(v)
+      ).onComplete(next);
+    };`,
+    [[0], [1], [2]]
+  );
+
+  check(
+    "waits in branches, wait-only last step",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          api.get(id, f.slot());
+        },
+        (v) => {
+          if (id) {
+            api.put(v, f.wait());
+          }
+        }
+      ).onComplete(next);
+    };`,
+    [[1], [0]]
+  );
+
+  check(
+    "succeed as the last statement of a branch",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          api.get(id, f.slot());
+        },
+        (v) => {
+          if (id === 1) {
+            f.succeed("one");
+          } else {
+            api.get(v, f.slot());
+          }
+        }
+      ).onSuccess((v) => next(null, v)).onError(next);
+    };`,
+    [[1], [2]]
+  );
+});
+
 describe("skips", () => {
   check(
     "f inside a nested callback",
@@ -229,11 +360,58 @@ describe("skips", () => {
   );
 
   check(
-    "slot in a branch",
+    "slot in a branch that never registers can't pick a position",
     `module.exports.run = function (id, next) {
       const f = ff(
         () => {
           if (id) api.get(id, f.slot());
+          api.get(2, f.slot());
+        },
+        (a, b) => f.pass([a, b])
+      ).onComplete(next);
+    };`,
+    [[]],
+    true
+  );
+
+  check(
+    "branches giving different values",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          if (id) api.get(id, f.slot());
+          else api.two(f.slotMulti(2));
+        },
+        (a, b) => f.pass([a, b])
+      ).onComplete(next);
+    };`,
+    [[]],
+    true
+  );
+
+  check(
+    "a slot that is never called back",
+    `module.exports.run = function (next) {
+      const f = ff(
+        () => {
+          f.wait();
+        },
+        () => f.pass(1)
+      ).onComplete(next);
+    };`,
+    [[]],
+    true
+  );
+
+  check(
+    "code after a slot in a branch",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          if (id) {
+            api.get(id, f.slot());
+            api.put(1, () => {});
+          }
         },
         (v) => f.pass(v)
       ).onComplete(next);
@@ -321,4 +499,39 @@ export function load(id: string, next: (err: Error | null, v?: string) => void) 
     }
     "
   `);
+});
+
+it("two branched steps get different array names", () => {
+  const out = transform(`${header}module.exports.run = function (id, next) {
+  const f = ff(
+    () => {
+      if (id) api.get(id, f.slot());
+    },
+    (v) => {
+      if (v) api.get(v, f.slot());
+    },
+    (w) => f.pass(w)
+  ).onComplete(next);
+};`);
+  expect(out.text).toContain("const pending = []");
+  expect(out.text).toContain("const pending2 = []");
+});
+
+describe("pass of a same-named value after a slot", () => {
+  check(
+    "is not declared twice",
+    `module.exports.run = function (id, next) {
+      const f = ff(
+        () => {
+          api.get(id, f.slot());
+        },
+        (attributes) => {
+          api.slow(id, f.slot());
+          f.pass(attributes);
+        },
+        (s, attributes) => f.pass(s + attributes)
+      ).onComplete(next);
+    };`,
+    [[1]]
+  );
 });

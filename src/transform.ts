@@ -53,6 +53,7 @@ interface Reg {
   n: number; // values it adds to the next step's args
   host?: CallExpression; // the call that gets the slot callback
   argIndex?: number;
+  pos?: number; // index in the promise array of a step with branches
 }
 
 interface Param {
@@ -68,6 +69,9 @@ interface Step {
   params: Param[];
   regs: Reg[];
   terminals: CallExpression[];
+  shape: number[]; // values given at each position, see walkStep
+  valueCount: number;
+  branched: boolean; // a registration is inside an if/else
 }
 
 interface Ctx {
@@ -77,6 +81,7 @@ interface Ctx {
   fName: string;
   templates: [number, number][];
   used: Set<string>;
+  fresh: Set<string>;
 }
 
 export function transform(source: string, fileName = "file.js"): TransformResult {
@@ -92,13 +97,14 @@ export function transform(source: string, fileName = "file.js"): TransformResult
     const ffName = findFfImport(sf)?.name;
     if (!ffName) break;
     const edits: Edit[] = [];
+    const fresh = new Set<string>();
     skipped = [];
     for (const decl of findChains(sf, ffName)) {
       const stmt = decl.getFirstAncestorByKindOrThrow(SyntaxKind.VariableStatement);
       const line = stmt.getStartLineNumber();
       if (edits.some((e) => e.start < stmt.getEnd() && stmt.getStart() < e.end)) continue;
       try {
-        const ctx: Ctx = { sf, text, ts: /\.tsx?$/.test(fileName), fName: "", templates: templateRanges(sf), used };
+        const ctx: Ctx = { sf, text, ts: /\.tsx?$/.test(fileName), fName: "", templates: templateRanges(sf), used, fresh };
         edits.push(convertChain(ctx, decl));
       } catch (e) {
         if (!(e instanceof Skip)) throw e;
@@ -247,19 +253,12 @@ function analyzeStep(ctx: Ctx, fn: Node): Step {
     });
   }
 
-  const regs: Reg[] = [];
-  for (const item of items) {
-    const reg = classify(ctx, item);
-    if (reg) regs.push(reg);
-  }
-
   const terminals: CallExpression[] = [];
   for (const call of fn.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const m = fMethod(ctx, call);
     if (m !== "succeed" && m !== "fail") continue;
     const parent = call.getParentOrThrow();
-    const last = items[items.length - 1];
-    const atEnd = parent === fn || (Node.isExpressionStatement(parent) && parent === last);
+    const atEnd = parent === fn || (Node.isExpressionStatement(parent) && endsStep(fn, parent));
     const returned = Node.isReturnStatement(parent) && own(parent);
     if (!atEnd && !returned) {
       throw new Skip(call, `f.${m}() without return, or in a nested callback; code after it still ran in ff`);
@@ -269,14 +268,19 @@ function analyzeStep(ctx: Ctx, fn: Node): Step {
     terminals.push(call);
   }
 
+  const { regs, shape } = walkStep(ctx, items, terminals);
+
   // Every use of `f` must be one of the calls above.
   const accounted = new Set<Node>([...regs.map((r) => r.fCall), ...terminals]);
   fn.forEachDescendant((d) => {
     if (!Node.isIdentifier(d) || d.getText() !== ctx.fName || isPropertyName(d)) return;
     const pa = d.getParent();
     const call = pa && Node.isPropertyAccessExpression(pa) ? pa.getParent() : undefined;
+    if (call && !accounted.has(call) && Node.isExpressionStatement(call.getParent()) && SLOT_KINDS.has(fMethod(ctx, call)!)) {
+      throw new Skip(d, `${call.getText()} is never called back, so the chain never ends in ff`);
+    }
     if (!call || !accounted.has(call)) {
-      throw new Skip(d, `${ctx.fName} is used in a nested callback, a branch or as a value`);
+      throw new Skip(d, `${ctx.fName} is used in a loop, a nested callback or as a value`);
     }
   });
 
@@ -289,7 +293,98 @@ function analyzeStep(ctx: Ctx, fn: Node): Step {
     }
   });
 
-  return { fn, items, params, regs, terminals };
+  const branched = regs.some((r) => !items.includes(r.item));
+  return { fn, items, params, regs, terminals, shape, valueCount: shape.reduce((a, b) => a + b, 0), branched };
+}
+
+// True when nothing in the step runs after `stmt`: it is last in its block,
+// and so is each if/else around it.
+function endsStep(fn: Step["fn"], stmt: Node): boolean {
+  let node = stmt;
+  while (node !== fn.getBody()) {
+    const parent = node.getParentOrThrow();
+    if (Node.isBlock(parent)) {
+      const stmts = parent.getStatements();
+      if (stmts[stmts.length - 1] !== node) return false;
+    } else if (!Node.isIfStatement(parent)) {
+      return false;
+    }
+    node = parent;
+  }
+  return true;
+}
+
+// Walks a step in order, through if/else, and gives each registration its
+// position in the next step's args. In ff those args are in the order the
+// slots were made, so a slot in a branch is fine as long as every branch
+// that registers gives the same values in the same positions; a branch that
+// gives fewer can only be followed by nothing that gives a value.
+// Rejects code, succeed or fail after a slot on the same path: in ff they
+// dropped the slot's result, after an await they would leave its error
+// unhandled.
+function walkStep(ctx: Ctx, items: Node[], terminals: CallExpression[]) {
+  interface State {
+    started: boolean; // a slot is pending on this path
+    shape: number[]; // values given at each position so far
+    shifted: boolean; // an earlier branch gave fewer values than another
+    ended: boolean; // the path ended with succeed, fail or throw
+  }
+  const regs: Reg[] = [];
+  const termStmts = new Set<Node>(terminals.map((t) => t.getParentOrThrow()));
+  const walk = (stmts: Node[], st: State) => {
+    for (const s of stmts) {
+      const reg = classify(ctx, s);
+      if (reg) {
+        if (reg.n) {
+          if (st.shifted) throw new Skip(s, "a value after a branch that gives fewer values; the next step's args would shift");
+          reg.pos = st.shape.length;
+          // A pass gives one position per value, a slot one for all of them.
+          if (reg.kind === "pass") st.shape.push(...Array(reg.n).fill(1));
+          else st.shape.push(reg.n);
+        }
+        if (reg.host) st.started = true;
+        regs.push(reg);
+      } else if (termStmts.has(s) || Node.isThrowStatement(s)) {
+        if (st.started) throw new Skip(s, "succeed, fail or throw after a slot on the same path; ff dropped the slot's result");
+        st.ended = true;
+      } else if (Node.isIfStatement(s) && refNames(s).has(ctx.fName)) {
+        // After a slot, a throw in the condition would leave that slot's
+        // rejection unhandled; only allow conditions that can't call anything.
+        const cond = s.getExpression();
+        if (st.started && (cond.getFirstDescendant((d) => Node.isCallExpression(d) || Node.isNewExpression(d) || Node.isTaggedTemplateExpression(d)) || Node.isCallExpression(cond))) {
+          throw new Skip(s, "a condition that calls a function after a slot in the same step");
+        }
+        const branches = [s.getThenStatement(), s.getElseStatement()].map((b) => {
+          const out: State = { started: false, shape: [...st.shape], shifted: st.shifted, ended: false };
+          if (b) walk(Node.isBlock(b) ? b.getStatements() : [b], out);
+          return out;
+        });
+        // A branch that ended doesn't reach the code after the if.
+        const going = branches.filter((b) => !b.ended);
+        if (!going.length) {
+          st.ended = true;
+          continue;
+        }
+        const longest = going.reduce((a, b) => (b.shape.length > a.shape.length ? b : a)).shape;
+        for (const b of going) {
+          if (b.shape.some((n, i) => n !== longest[i])) throw new Skip(s, "branches give different values in the same position");
+        }
+        st.shape = longest;
+        st.started = going.some((b) => b.started);
+        st.shifted = going.some((b) => b.shifted || b.shape.length !== longest.length);
+      } else if (st.ended) {
+        throw new Skip(s, "code after succeed, fail or throw");
+      } else if (st.started) {
+        throw new Skip(s, "code after a slot in the same step");
+      }
+    }
+  };
+  const st: State = { started: false, shape: [], shifted: false, ended: false };
+  walk(items, st);
+  // Waits give no value; they go after the values in the promise array.
+  let k = st.shape.length;
+  for (const r of regs) if (!r.n && r.host) r.pos = k++;
+  return { regs, shape: st.shape };
 }
 
 function fMethod(ctx: Ctx, call: Node): string | undefined {
@@ -346,14 +441,14 @@ function split(step: Step) {
 
 function checkArgCounts(steps: Step[]) {
   steps.forEach((s, i) => {
-    const n = s.regs.reduce((sum, r) => sum + r.n, 0);
+    const n = s.valueCount;
     const next = steps[i + 1];
     if (next && next.params.length > n) {
       throw new Skip(next.fn, `step ${i + 2} takes ${next.params.length} args but step ${i + 1} gives ${n}`);
     }
     if (!next) {
       if (n > 1) throw new Skip(s.fn, "last step gives several values to the handlers");
-      if (s.regs.some((r) => step0Index(s, r) < tailStart(s))) {
+      if (!s.branched && s.regs.some((r) => step0Index(s, r) < tailStart(s))) {
         throw new Skip(s.fn, "last step passes a value before other code");
       }
     }
@@ -370,7 +465,7 @@ function tailStart(s: Step) {
 // The values each step's registrations give, as names of the next step's
 // params (undefined where the next step doesn't name it).
 function namesFor(steps: Step[], i: number): (Param | undefined)[] {
-  const n = steps[i].regs.reduce((sum, r) => sum + r.n, 0);
+  const n = steps[i].valueCount;
   const params = steps[i + 1]?.params ?? [];
   return Array.from({ length: n }, (_, k) => params[k]);
 }
@@ -380,6 +475,8 @@ function namesFor(steps: Step[], i: number): (Param | undefined)[] {
 function findAliases(steps: Step[]): Set<Param> {
   const aliases = new Set<Param>();
   steps.forEach((s, i) => {
+    // In a branch, the pass may not run; the name must be declared.
+    if (s.branched) return;
     const names = namesFor(steps, i);
     let k = 0;
     for (const r of s.regs) {
@@ -520,6 +617,8 @@ function stepEdits(
     edits.push({ ...range(node), pieces });
   }
 
+  if (step.branched) return [...edits, ...branchedEdits(ctx, step, names, next, isLast, target)];
+
   // Value index of each registration in the next step's args.
   const offset = new Map<Reg, number>();
   step.regs.reduce((k, r) => (offset.set(r, k), k + r.n), 0);
@@ -538,8 +637,8 @@ function stepEdits(
     } else if (tail.length === 1) {
       pieces = [gen(n ? "return " : "await "), ...promisePieces(ctx, tail[0]), gen(";")];
     } else {
-      const idx = elements(ctx, tail, names, offset).findIndex((e) => e.n === 1);
-      const all = [gen("Promise.all(["), ...joinPieces(elements(ctx, tail, names, offset).map((e) => e.pieces)), gen("])")];
+      const idx = elements(ctx, tail, names, offset, aliases).findIndex((e) => e.n === 1);
+      const all = [gen("Promise.all(["), ...joinPieces(elements(ctx, tail, names, offset, aliases).map((e) => e.pieces)), gen("])")];
       pieces = n ? [gen("return (await "), ...all, gen(`)[${idx}];`)] : [gen("await "), ...all, gen(";")];
     }
     edits.push({ start: tail[0].item.getStart(), end: tail[tail.length - 1].item.getEnd(), pieces: withComments(ctx, tail, pieces, target) });
@@ -566,7 +665,7 @@ function stepEdits(
   }
   if (!tail.length) return edits;
 
-  const els = elements(ctx, tail, names, offset);
+  const els = elements(ctx, tail, names, offset, aliases);
   const bindings = els.map((e) => bindingFor(e.names));
   const anyName = bindings.some((b) => b.text);
   const kw = els.some((e) => e.names.some((p) => p && assigned(p))) ? "let " : "const ";
@@ -589,6 +688,69 @@ function stepEdits(
   return edits;
 }
 
+// A step with slots in if/else: each slot or pass stores its promise or
+// value at its position in an array, and the step ends by awaiting all of
+// it. A position no branch filled is a hole, which Promise.all gives as
+// undefined, as ff did.
+function branchedEdits(
+  ctx: Ctx,
+  step: Step,
+  names: (Param | undefined)[],
+  next: Step | undefined,
+  isLast: boolean,
+  target: string
+): Edit[] {
+  const arr = freshName(ctx, "pending");
+  const edits: Edit[] = step.regs.map((r) => {
+    const set = (k: number, value: Piece[]) => [gen(`${arr}[${k}] = `), ...value, gen(";")];
+    const pieces =
+      r.kind === "pass"
+        ? r.fCall.getArguments().flatMap((a, j) => [...(j ? [gen(" ")] : []), ...set(r.pos! + j, [orig(ctx, a.getStart(), a.getEnd())])])
+        : set(r.pos!, promisePieces(ctx, r));
+    return { start: r.item.getStart(), end: r.item.getEnd(), pieces };
+  });
+
+  const items = step.items;
+  const first = items[0];
+  const last = items[items.length - 1];
+  const decl = `const ${arr}${ctx.ts ? ": any[]" : ""} = [];\n${target}`;
+  let end: string;
+  if (isLast) {
+    end = step.valueCount ? `return (await Promise.all(${arr}))[0];` : `await Promise.all(${arr});`;
+  } else {
+    let offset = 0;
+    const bindings = step.shape.map((n) => {
+      const b = bindingFor(names.slice(offset, offset + n));
+      offset += n;
+      return b;
+    });
+    let k = bindings.length;
+    while (k > 0 && !bindings[k - 1].text) k--;
+    const used = bindings.slice(0, k);
+    const assigned = names.some((p) => p && next && p.names.some((n) => isAssigned(next.fn, n)));
+    const type = ctx.ts && used.some((b) => b.type) ? ": [" + used.map((b) => b.type ?? "any").join(", ") + "]" : "";
+    end = k
+      ? `${assigned ? "let" : "const"} [${used.map((b) => b.text).join(", ")}]${type} = await Promise.all(${arr});`
+      : `await Promise.all(${arr});`;
+  }
+  // First, so it comes before an edit that starts at the same place.
+  edits.unshift({ start: first.getStart(), end: first.getStart(), pieces: [gen(decl)] });
+  edits.push({ start: last.getEnd(), end: last.getEnd(), pieces: [gen(`\n${target}${end}`)] });
+  return edits;
+}
+
+// A name not used in the file, nor already handed out in this pass.
+function freshName(ctx: Ctx, base: string): string {
+  const taken = refNames(ctx.sf);
+  for (let i = 1; ; i++) {
+    const name = i === 1 ? base : base + i;
+    if (!taken.has(name) && !ctx.fresh.has(name)) {
+      ctx.fresh.add(name);
+      return name;
+    }
+  }
+}
+
 // Comments between the tail statements would be lost; put them first.
 function withComments(ctx: Ctx, tail: Reg[], pieces: Piece[], target: string): Piece[] {
   const comments = tail.slice(1).flatMap((r) => r.item.getLeadingCommentRanges().map((c) => c.getText()));
@@ -597,11 +759,15 @@ function withComments(ctx: Ctx, tail: Reg[], pieces: Piece[], target: string): P
 
 // One Promise.all element per value source: a slot's promise, or one per
 // pass argument, with the next step's params it fills.
-function elements(ctx: Ctx, regs: Reg[], names: (Param | undefined)[], offset: Map<Reg, number>) {
+// A pass into a param of the same name (an alias) needs no element.
+function elements(ctx: Ctx, regs: Reg[], names: (Param | undefined)[], offset: Map<Reg, number>, aliases: Set<Param>) {
   return regs.flatMap((r) => {
     const k = offset.get(r)!;
     if (r.kind === "pass") {
-      return r.fCall.getArguments().map((a, j) => ({ n: 1, pieces: [orig(ctx, a.getStart(), a.getEnd())], names: [names[k + j]] }));
+      return r.fCall
+        .getArguments()
+        .map((a, j) => ({ n: 1, pieces: [orig(ctx, a.getStart(), a.getEnd())], names: [names[k + j]] }))
+        .filter((e) => !(e.names[0] && aliases.has(e.names[0])));
     }
     return [{ n: r.n, pieces: promisePieces(ctx, r), names: names.slice(k, k + r.n) }];
   });
