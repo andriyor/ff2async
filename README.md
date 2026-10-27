@@ -79,8 +79,53 @@ A nested chain converts first; the chain around it converts on a later pass, whe
 
 - A slot callback called twice: ff took the second value, a promise keeps the first.
 - `callbackify` turns a falsy rejection into an `Error` with `.reason`.
-- A step's error goes to the handler as before. A throw inside a handler is now an unhandled rejection under `.then()`, not an uncaught exception; both crash Node by default.
+- A step's error goes to the handler as before. A throw inside a handler is now an unhandled rejection under `.then()`, not an uncaught exception; both crash Node by default. See [`callbackify` for `.onComplete`](#callbackify-for-oncomplete-then-for-onsuccessonerror).
 - In TypeScript, `promisify` infers types from the callee, which ff ignored. A cast like `as (..., next: () => void) => void` now gives `Promise<void>`, and tsc reports it. Fix it by hand.
+
+## Technical decisions
+
+### `callbackify` for `.onComplete`, `.then` for `.onSuccess`/`.onError`
+
+An `.onComplete(cb)` chain becomes `callbackify(...)(cb)`, not the shorter
+
+```js
+(async () => { ... })().then((v) => cb(null, v), (err) => cb(err));
+```
+
+The two differ only when the callback itself throws, for example when `next` crashes while rendering a response:
+
+| | ff | `callbackify` | `.then(s, e)` |
+|---|---|---|---|
+| Callback throws | uncaught exception | uncaught exception, rethrown on the next tick | rejection nothing handles |
+| Process | crashes | crashes | crashes on Node 15+ with the default `--unhandled-rejections=throw`; keeps running if the app has an `unhandledRejection` handler or that flag is changed |
+| Reported as | uncaught exception | uncaught exception | unhandled rejection |
+
+`callbackify` matches ff in every row. `.then(s, e)` matches only while Node's default holds, and even then the crash is reported as a different kind of error, which error-reporting tools can treat differently.
+
+`.onSuccess`/`.onError` chains still end in `.then(s, e)` or `.catch(e)`: their handlers are two separate functions, not one Node callback, so `callbackify` doesn't fit. They carry the risk above; check the target app's `unhandledRejection` handling before relying on them.
+
+### A named `fnAsync` instead of an inline wrapper
+
+Where the chain is the whole function, its body moves to `fnAsync` and `fn` becomes `callbackify(fnAsync)(..., next)`. It's the same amount of `callbackify`, but less nesting, and each function gets an async version that callers can switch to one at a time. Once nothing calls `fn` with a callback, `fn` can be deleted.
+
+It is only done when it can't change behaviour:
+
+- **Setup must not throw.** Before, a throw in the setup reached `fn`'s caller; inside `fnAsync` it would reach the callback. Only declarations of literals, names, arrays, objects and functions are moved.
+- **The callback is `next` or `h(next)`.** A custom `function (err) {...}` that logs or reshapes the result belongs to the callback API, so that wrapper stays inline.
+- **The callback is used nowhere else.** `next = next || noop` or a second use keeps the inline form.
+
+`fnAsync` rejects with the raw error, before `h` (e.g. a helper that wraps errors) is applied. Callback callers see no change; callers moved to `fnAsync` get the raw error.
+
+### Not removing `promisify`
+
+`promisify` can only go where the callee already returns a promise, and that is a fact about the callee, not the call site:
+
+- **Callback-only libraries** keep it; removing it needs a library upgrade or a per-library rule (e.g. `.promise()` on aws-sdk v2).
+- **Local functions** could become plain `async`, but only by changing the function and every caller at once. A generic callback-to-async rewrite can't know whether a callback is called once, twice or never, which is the behaviour ff guarantees and this codemod relies on. The `fnAsync` split is the safe part of that: callers switch to `await fnAsync(...)`, and `promisify(fn)` goes with them.
+
+### Not using an existing codemod
+
+Existing callback/promise codemods (e.g. [asyncify](https://github.com/codemodsquad/asyncify), [async-await-codemod](https://github.com/sgilroy/async-await-codemod)) convert `.then` chains, not callbacks or ff. Run on this codemod's output, asyncify only wraps the `.then(s, e)` endings in another async function. Its parser also rejects TypeScript's `import x = require()`.
 
 ## Codemod or migrate-ff skill
 
