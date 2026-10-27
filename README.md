@@ -3,6 +3,7 @@
 Codemod that rewrites straight-line [`ff`](https://github.com/play-co/ff) chains to async/await. Chains it can't convert safely are left as they are and reported with the reason. The mapping follows [ff-behavior](https://github.com/andriyor/ff-behavior) and its `migrate-ff` skill.
 
 ```bash
+git clone https://github.com/andriyor/ff2async.git && cd ff2async
 npm install && npm run build
 node build/cli.js --dry file.js ...   # print the result, change nothing
 node build/cli.js file.js ...         # rewrite in place
