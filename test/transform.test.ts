@@ -552,3 +552,109 @@ export function a(next: any) {
   expect(out.text).toContain(`import { callbackify, promisify } from "util";`);
   expect(out.text).not.toContain("ff");
 });
+
+describe("splits a callbackify wrapper into fnAsync", () => {
+  const cases: [string, string, any[][], string][] = [
+    [
+      "const fn, exported later, setup moved, error helper kept",
+      `const wrap = (next) => (err, ...v) => next(err ? new Error("wrapped " + err.message) : null, ...v);
+const run = function run(id, next) {
+  let seen = 0;
+  const f = ff(
+    () => {
+      seen++;
+      api.get(id, f.slot());
+    },
+    (v) => {
+      if (id === 2) return f.fail(new Error("two"));
+      f.pass(v + seen);
+    }
+  ).onComplete(wrap(next));
+};
+module.exports.run = run;`,
+      [[1], [2]],
+      "async function runAsync(id)",
+    ],
+    [
+      "module.exports.name = function",
+      `module.exports.run = function (id, next) {
+  const f = ff(() => {
+    api.get(id, f.slot());
+  }).onComplete(next);
+};`,
+      [[1]],
+      "module.exports.runAsync = runAsync;",
+    ],
+  ];
+  for (const [name, body, inputs, expected] of cases) {
+    it(name, async () => {
+      const before = header + body;
+      const out = transform(before);
+      expect(out.text).toContain(expected);
+      expect(out.text).not.toContain("ff2async");
+      expect(out.text).not.toContain("callbackify(async");
+      const mod = { exports: {} as any };
+      new Function("module", "require", "api", out.text)(mod, require, api);
+      for (const input of inputs) {
+        const want = await call(load(before), ...input);
+        expect(await call(load(out.text), ...input), out.text).toEqual(want);
+        const viaAsync = await mod.exports.runAsync(...input).then(
+          (v: any) => ({ values: [v] }),
+          (e: any) => ({ err: e.message })
+        );
+        // The async version gives the raw error, before the callback's helper.
+        if ("err" in (want as any)) expect(viaAsync.err).toBeTruthy();
+        else expect(viaAsync).toEqual(want);
+      }
+    });
+  }
+
+  it("leaves a wrapper alone when the callback is used elsewhere or setup can throw", () => {
+    for (const body of [
+      `const run = function (id, next) {
+  if (!next) next = () => {};
+  const f = ff(() => {
+    api.get(id, f.slot());
+  }).onComplete(next);
+};`,
+      `const run = function (id, next) {
+  const x = compute(id);
+  const f = ff(() => {
+    api.get(x, f.slot());
+  }).onComplete(next);
+};`,
+      `const run = function (id, next) {
+  const f = ff(() => {
+    api.get(id, f.slot());
+  }).onComplete((err, v) => next(err, v));
+};`,
+    ]) {
+      const out = transform(header + body);
+      expect(out.converted).toBe(1);
+      expect(out.text, out.text).toContain("callbackify(async () => {");
+      expect(out.text).not.toContain("runAsync");
+    }
+  });
+
+  it("an existing callbackify(async) is not split", () => {
+    const src = `${header}const { callbackify } = require("util");
+const run = function (id, next) {
+  callbackify(async () => 1)(next);
+};
+const other = function (next) {
+  const f = ff(() => f.pass(1)).onComplete(next);
+};`;
+    const out = transform(src);
+    expect(out.text).toContain("callbackify(async () => 1)(next);");
+    expect(out.text).toContain("async function otherAsync()");
+  });
+});
+
+it("splits when a nested callback has its own param of the same name", () => {
+  const out = transform(`${header}const run = function (ids, next) {
+  const f = ff(() => {
+    api.each(ids, (id, next) => next(null, id), f.slot());
+  }).onComplete(next);
+};`);
+  expect(out.text).toContain("async function runAsync(ids)");
+});

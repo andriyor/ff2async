@@ -43,6 +43,20 @@ callbackify(async () => {
 | `.onComplete(cb)` | `callbackify(async () => {...})(cb)` |
 | `.onSuccess(s)` / `.onError(e)` | `(async () => {...})().then(s, e)` / `.catch(e)` |
 
+When the chain is the whole function, after setup that can't throw (declarations of literals, names, arrays, objects or functions), and its `onComplete` gets the function's own callback as `next` or `h(next)`, the body moves to an async function next to it:
+
+```js
+const getStatus = function (doc, next) {
+  callbackify(getStatusAsync)(doc, error.hc(next));
+};
+
+async function getStatusAsync(doc) {
+  // setup and chain body
+}
+```
+
+`getStatusAsync` is exported wherever `getStatus` is, so callers can move to it one at a time. It rejects with the raw error, before `h` (here `error.hc`) is applied. Any other `onComplete` keeps the inline `callbackify(async () => {...})(cb)`.
+
 The ff import is removed when no chain is left, and `promisify`/`callbackify` are imported from `util`.
 
 ## What it skips
