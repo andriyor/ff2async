@@ -535,3 +535,20 @@ describe("pass of a same-named value after a slot", () => {
     [[1]]
   );
 });
+
+it("adds to an existing util import", () => {
+  const out = transform(
+    `import { callbackify } from "util";
+import ff = require("ff");
+export function a(next: any) {
+  const f = ff(() => {
+    api.get(1, f.slot());
+  }).onComplete(next);
+}
+`,
+    "x.ts"
+  );
+  expect(out.text.match(/from "util"/g)).toHaveLength(1);
+  expect(out.text).toContain(`import { callbackify, promisify } from "util";`);
+  expect(out.text).not.toContain("ff");
+});

@@ -841,6 +841,12 @@ function fixImports(project: Project, fileName: string, text: string, used: Set<
   const imp = findFfImport(sf);
   const needed = [...used].sort().filter((n) => !isBoundAtTop(sf, n));
   if (!imp) return text;
+  // Add to an existing `import { ... } from "util"` instead of a second one.
+  const utilImport = sf.getImportDeclarations().find((d) => d.getModuleSpecifierValue() === "util" && d.getNamedImports().length);
+  if (needed.length && utilImport) {
+    utilImport.addNamedImports(needed);
+    return fixImports(project, fileName, sf.getFullText(), new Set());
+  }
   const stillUsed = sf.getDescendantsOfKind(SyntaxKind.Identifier).some((id) => id.getText() === imp.name && !id.getFirstAncestor((a) => a === imp.stmt) && !isPropertyName(id));
   const q = imp.quote;
   const line = needed.length
