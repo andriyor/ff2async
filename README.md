@@ -1,6 +1,6 @@
 # ff2async
 
-Codemod that rewrites straight-line [`ff`](https://github.com/play-co/ff) chains to async/await. Chains it can't convert safely are left as they are and reported with the reason. The mapping follows [ff-behavior](../ff-behavior) and its `migrate-ff` skill.
+Codemod that rewrites straight-line [`ff`](https://github.com/play-co/ff) chains to async/await. Chains it can't convert safely are left as they are and reported with the reason. The mapping follows [ff-behavior](https://github.com/andriyor/ff-behavior) and its `migrate-ff` skill.
 
 ```bash
 npm install && npm run build
@@ -129,7 +129,7 @@ Existing callback/promise codemods (e.g. [asyncify](https://github.com/codemodsq
 
 ## Codemod or migrate-ff skill
 
-Use both. The codemod does the mechanical bulk; the [`migrate-ff` skill](../ff-behavior/skills/migrate-ff/SKILL.md) does the rest.
+Use both. The codemod does the mechanical bulk; the [`migrate-ff` skill](https://github.com/andriyor/ff-behavior/blob/master/skills/migrate-ff/SKILL.md) does the rest.
 
 The codemod is better at:
 
